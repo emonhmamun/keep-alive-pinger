@@ -1,0 +1,68 @@
+# ============================================================
+# ARBPRO Keep-Alive — External Pinger
+# ============================================================
+# Runs every 5 minutes from GitHub's servers (worldwide, 24/7).
+# Pings the ARBPRO sandbox public URL to generate inbound traffic,
+# which prevents the cloud container from being suspended.
+#
+# This is Layer 2 of the 24/7 keep-alive architecture:
+#   - Layer 1 (internal): /home/sync/keep-alive/keepalive.js
+#   - Layer 2 (external): THIS workflow
+#
+# PRIVACY: No URL is hardcoded here. The URL is read from the
+# encrypted GitHub secret ARBPRO_URL. No project source code,
+# no project name, no sensitive data is exposed in this file.
+#
+# Public repo = unlimited GitHub Actions minutes (free).
+# ============================================================
+name: ARBPRO Keep-Alive
+
+on:
+  schedule:
+    # Every 5 minutes (the minimum cron granularity for GitHub Actions)
+    - cron: '*/5 * * * *'
+  # Allow manual triggering from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping ARBPRO sandbox
+        env:
+          # URL comes from encrypted repository secret — never logged
+          PING_URL: ${{ secrets.ARBPRO_URL }}
+        run: |
+          # If the secret is not set, exit cleanly (don't fail the workflow)
+          if [ -z "$PING_URL" ]; then
+            echo "⚠️ ARBPRO_URL secret is not configured."
+            echo "   Set it in: Settings → Secrets and variables → Actions → New repository secret"
+            echo "   Name: ARBPRO_URL"
+            echo "   Value: https://your-sandbox-public-url"
+            exit 0
+          fi
+
+          echo "Pinging ARBPRO sandbox (URL hidden for privacy)..."
+
+          # Layer A: ping the /api/health endpoint (status check)
+          HEALTH_RESPONSE=$(curl -s -m 10 -o /dev/null -w "%{http_code}" "$PING_URL/api/health" 2>/dev/null || echo "000")
+
+          # Layer B: ping the keepalive-status endpoint (auto-starts internal keep-alive if down)
+          KEEPALIVE_RESPONSE=$(curl -s -m 10 -o /dev/null -w "%{http_code}" "$PING_URL/api/keepalive-status" 2>/dev/null || echo "000")
+
+          # Layer C: ping the root URL (some platforms track root-path traffic)
+          ROOT_RESPONSE=$(curl -s -m 10 -o /dev/null -w "%{http_code}" "$PING_URL" 2>/dev/null || echo "000")
+
+          echo "  /api/health          → HTTP $HEALTH_RESPONSE"
+          echo "  /api/keepalive-status → HTTP $KEEPALIVE_RESPONSE"
+          echo "  / (root)              → HTTP $ROOT_RESPONSE"
+
+          # Any non-000 response means the server responded = alive
+          if [ "$HEALTH_RESPONSE" != "000" ] || [ "$KEEPALIVE_RESPONSE" != "000" ] || [ "$ROOT_RESPONSE" != "000" ]; then
+            echo "✅ ALIVE — server responded"
+          else
+            echo "⚠️ UNREACHABLE — ping was sent (may wake the container on next request)"
+          fi
+
+          echo "Done."
