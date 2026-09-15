@@ -1,0 +1,49 @@
+# ATLAS Keep-Alive — External Pinger (Layer 2)
+# Repo: emonhmamun/keep-alive-pinger (public)
+#
+# Every 5 minutes, GitHub's runners (24/7, global) ping the sandbox's
+# /api/keepalive-status endpoint. That endpoint not only checks liveness
+# but ALSO auto-starts the internal pinger if it has died — so an
+# external wake ping resurrects the whole stack.
+#
+# Privacy: NO URL is hardcoded here. The URL lives only in the
+# ATLAS_URL repository secret (encrypted). Logs never print the URL.
+#
+# Public repo = unlimited Actions minutes = free 24/7.
+
+name: ATLAS Keep-Alive
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 minutes
+  workflow_dispatch:         # manual trigger
+
+permissions:
+  contents: read
+
+concurrency:
+  group: atlas-keep-alive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping ATLAS
+        env:
+          PING_URL: ${{ secrets.ATLAS_URL }}
+        run: |
+          set +e
+          if [ -z "$PING_URL" ]; then
+            echo "::warning::ATLAS_URL secret is not set. Go to Settings > Secrets and variables > Actions > New repository secret, name=ATLAS_URL, value=<your sandbox URL>"
+            exit 0
+          fi
+          TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          CODE=$(curl -s -m 10 -o /dev/null -w "%{http_code}" "${PING_URL}/api/keepalive-status" 2>/dev/null || echo "000")
+          if [ "$CODE" != "000" ]; then
+            echo "::notice::[$TS] ALIVE (HTTP $CODE) — keep-alive ping succeeded"
+          else
+            echo "::warning::[$TS] unreachable — wake ping sent anyway (will resurrect on next cycle)"
+          fi
+          exit 0
