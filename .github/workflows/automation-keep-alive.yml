@@ -1,0 +1,29 @@
+# Automation Keep-Alive
+# Pings the sandbox every 5 minutes to prevent Aliyun FC suspension.
+# URL is stored as encrypted GitHub secret (AUTOMATION_URL) — never hardcoded.
+name: Automation Keep-Alive
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping sandbox
+        env:
+          AUTOMATION_URL: ${{ secrets.AUTOMATION_URL }}
+        run: |
+          if [ -z "$AUTOMATION_URL" ]; then
+            echo "AUTOMATION_URL secret not set"
+            exit 0
+          fi
+          RESPONSE=$(curl -s -m 10 -o /dev/null -w "%{http_code}" "$AUTOMATION_URL/api/system-health" 2>/dev/null || echo "000")
+          if [ "$RESPONSE" != "000" ]; then
+            echo "✅ ALIVE (HTTP $RESPONSE)"
+          else
+            echo "⚠️ unreachable — ping sent, will wake up if suspended"
+          fi
