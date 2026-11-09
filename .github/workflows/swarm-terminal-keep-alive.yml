@@ -1,84 +1,176 @@
 # ============================================================
-# SWARM TERMINAL Keep-Alive — External Pinger
+# SWARM TERMINAL Keep-Alive & External Watch — Layer 2
 # ============================================================
-# Runs every 5 minutes from GitHub's servers (worldwide, 24/7).
-# Pings the SWARM TERMINAL sandbox public URL to generate inbound traffic,
-# which prevents the cloud container from being suspended.
+# Runs every ~10 minutes. Two trigger paths (belt & braces):
+#   1. schedule (GitHub cron — best-effort; heavily load-shed at */5,
+#      so an offset */10 pattern is used)
+#   2. workflow_dispatch from the sandbox's internal watchdog
+#      (/home/sync/keep-alive/keepalive.js, every 10 min)
 #
-# This is Layer 2 of the 24/7 keep-alive architecture:
-#   - Layer 1 (internal): /home/sync/keep-alive/keepalive.js
-#   - Layer 2 (external): THIS workflow
+# What it does:
+#   A. DIRECT PING (informational): pings the sandbox URL. The platform
+#      currently disables the sandbox's public internet URL, so today this
+#      reports unreachable — it goes live automatically the moment the
+#      platform enables public ingress (zero changes needed).
+#   B. VAULT HEARTBEAT WITNESS (the authoritative check): the swarm engine
+#      pushes its trading state to the private SWARM-TERMINAL repo every
+#      ~5 min. A fresh pushed_at = the swarm is alive. Works from ANY network.
+#   C. ALERT LIFECYCLE: if the heartbeat is stale > 20 min, open a
+#      "SWARM TERMINAL DOWN" issue (GitHub emails the repo owner).
+#      When the heartbeat recovers, the issue auto-closes.
 #
-# PRIVACY: No URL is hardcoded here. The URL is read from the
-# encrypted GitHub secret SWARM_TERMINAL_URL. No project source code,
-# no sensitive data is exposed in this file.
-#
-# NOTE (2026-11-09): the current sandbox URL resolves to an
-# internal-only address (AliCloud FC internal endpoint / CGNAT), so
-# pings from the internet cannot reach it yet — the workflow reports
-# this honestly as UNREACHABLE. Layer 1 (internal watchdog) provides
-# the active keep-alive. If the sandbox later gets an internet-routable
-# URL, update the SWARM_TERMINAL_URL secret and this layer goes live
-# with zero other changes.
-#
-# Public repo = unlimited GitHub Actions minutes (free).
+# PRIVACY: no URLs or tokens hardcoded — everything comes from encrypted
+# repository secrets (SWARM_TERMINAL_URL, SWARM_TERMINAL_TOKEN).
+# Public repo = free unlimited Actions minutes.
 # ============================================================
 name: SWARM TERMINAL Keep-Alive
 
 on:
   schedule:
-    # Every 5 minutes (the minimum cron granularity for GitHub Actions)
-    - cron: '*/5 * * * *'
-  # Allow manual triggering from the Actions tab
+    # every 10 min, offset from the :00/:05 load-shedding peaks
+    - cron: '3-58/10 * * * *'
   workflow_dispatch:
+    inputs:
+      simulate:
+        description: 'test hook: "down" forces the stale-heartbeat alert path'
+        required: false
+        default: ''
+
+permissions:
+  issues: write
+
+concurrency:
+  group: swarm-terminal-watch
+  cancel-in-progress: false
 
 jobs:
-  ping:
+  watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 3
     steps:
-      - name: Ping SWARM TERMINAL sandbox
+      # ── A. direct ping (informational — never fails the run) ────────────
+      - name: Direct ping
         env:
-          # URL comes from encrypted repository secret — never logged
           PING_URL: ${{ secrets.SWARM_TERMINAL_URL }}
         run: |
-          # If the secret is not set, exit cleanly (don't fail the workflow)
           if [ -z "$PING_URL" ]; then
-            echo "⚠️ SWARM_TERMINAL_URL secret is not configured."
-            echo "   Set it in: Settings → Secrets and variables → Actions → New repository secret"
-            echo "   Name: SWARM_TERMINAL_URL"
-            echo "   Value: https://your-sandbox-public-url"
+            echo "SWARM_TERMINAL_URL secret not configured"
             exit 0
           fi
-
-          echo "Pinging SWARM TERMINAL sandbox (URL hidden for privacy)..."
-
-          # session-affinity header required by the sandbox gateway;
-          # IPv4 forced; 20s budget per ping (cold gateway paths can
-          # take >10s before a warm response follows).
-          SID="github-actions-pinger"
-
-          # Layer A: root path first (lightest — warms the gateway route)
-          ROOT_RESPONSE=$(curl -4 -s -m 20 --connect-timeout 8 -o /dev/null -w "%{http_code}" -H "x-session-id: $SID" "$PING_URL" 2>/dev/null || true)
-          : "${ROOT_RESPONSE:=000}"
-
-          # Layer B: keepalive-status (auto-starts internal keep-alive if down)
-          KEEPALIVE_RESPONSE=$(curl -4 -s -m 20 --connect-timeout 8 -o /dev/null -w "%{http_code}" -H "x-session-id: $SID" "$PING_URL/api/keepalive-status" 2>/dev/null || true)
-          : "${KEEPALIVE_RESPONSE:=000}"
-
-          # Layer C: engine health through the app proxy (auto-heals the engine)
-          HEALTH_RESPONSE=$(curl -4 -s -m 20 --connect-timeout 8 -o /dev/null -w "%{http_code}" -H "x-session-id: $SID" "$PING_URL/api/health" 2>/dev/null || true)
-          : "${HEALTH_RESPONSE:=000}"
-
-          echo "  / (root)              → HTTP $ROOT_RESPONSE"
-          echo "  /api/keepalive-status → HTTP $KEEPALIVE_RESPONSE"
-          echo "  /api/health           → HTTP $HEALTH_RESPONSE"
-
-          # Any non-000 response means the server responded = alive
-          if [ "$ROOT_RESPONSE" != "000" ] || [ "$KEEPALIVE_RESPONSE" != "000" ] || [ "$HEALTH_RESPONSE" != "000" ]; then
-            echo "✅ ALIVE — server responded"
+          # the sandbox gateway routes by session affinity — "swarm-keepalive"
+          # is the session the internal watchdog established. A marker header
+          # lets the app identify external pinger hits.
+          SID="swarm-keepalive"
+          PING_ALIVE=""
+          for path in "" "/api/keepalive-status" "/api/health"; do
+            CODE=$(curl -4 -s -m 20 --connect-timeout 8 -o /dev/null -w "%{http_code}" \
+              -H "x-session-id: $SID" -H "x-swarm-pinger: github-actions" \
+              "$PING_URL$path" 2>/dev/null) || true
+            : "${CODE:=000}"
+            echo "  ${path:-/} -> HTTP $CODE"
+            case "$CODE" in 2*|3*) PING_ALIVE=1 ;; esac
+          done
+          if [ -n "$PING_ALIVE" ]; then
+            echo "DIRECT PING: ALIVE — server responded"
           else
-            echo "⚠️ UNREACHABLE — ping was sent (may wake the container on next request)"
+            echo "DIRECT PING: unreachable (expected today — the platform disables the sandbox public internet URL; internal Layer 1 keep-alive is the active mechanism)"
           fi
 
-          echo "Done."
+      # ── B. vault heartbeat witness (the authoritative check) ────────────
+      - name: Vault heartbeat witness
+        env:
+          VAULT_TOKEN: ${{ secrets.SWARM_TERMINAL_TOKEN }}
+          SIMULATE: ${{ github.event.inputs.simulate }}
+        run: |
+          if [ "$SIMULATE" = "down" ]; then
+            echo "::notice::SIMULATED OUTAGE — forcing stale-heartbeat path (alert test)"
+            echo "HEARTBEAT=STALE" >> "$GITHUB_ENV"
+            exit 1
+          fi
+          if [ -z "$VAULT_TOKEN" ]; then
+            echo "::warning::SWARM_TERMINAL_TOKEN secret missing — cannot verify (neutral)"
+            echo "HEARTBEAT=UNKNOWN" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          fetch_pushed() {
+            curl -s -m 15 -H "Authorization: token $VAULT_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/emonhmamun/SWARM-TERMINAL \
+              | jq -r '.pushed_at // empty'
+          }
+          PUSHED=$(fetch_pushed)
+          if [ -z "$PUSHED" ]; then
+            sleep 5
+            PUSHED=$(fetch_pushed)
+          fi
+          if [ -z "$PUSHED" ]; then
+            echo "::warning::cannot read SWARM-TERMINAL repo state — skipping verdict (neutral)"
+            echo "HEARTBEAT=UNKNOWN" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          NOW=$(date +%s)
+          PT=$(date -d "$PUSHED" +%s 2>/dev/null || echo 0)
+          AGE=$((NOW - PT))
+          echo "VAULT HEARTBEAT: trading state pushed to GitHub ${AGE}s ago"
+          echo "HEARTBEAT_AGE=$AGE" >> "$GITHUB_ENV"
+          if [ "$AGE" -gt 1200 ]; then
+            echo "::error::SWARM TERMINAL DOWN — no state heartbeat for $((AGE / 60)) min"
+            echo "HEARTBEAT=STALE" >> "$GITHUB_ENV"
+            exit 1
+          fi
+          echo "HEARTBEAT=FRESH" >> "$GITHUB_ENV"
+
+      # ── C1. open alert issue when down (dedup, never duplicates) ────────
+      - name: Alert — open issue if swarm down
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$HEARTBEAT" != "STALE" ]; then
+            echo "not a verified stale heartbeat — not alerting"
+            exit 0
+          fi
+          TITLE="🚨 SWARM TERMINAL DOWN — no state heartbeat"
+          OPEN=$(curl -s -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/emonhmamun/keep-alive-pinger/issues?state=open&per_page=100" \
+            | jq -r '[.[] | select(.title | contains("SWARM TERMINAL DOWN"))] | length')
+          if [ "$OPEN" != "0" ]; then
+            echo "alert issue already open — keeping it"
+            exit 0
+          fi
+          AGE_H="${HEARTBEAT_AGE:-simulated}"
+          # NOTE: body assembled via printf so the YAML block scalar stays valid
+          # (unindented continuation lines would break YAML parsing); the
+          # resulting issue body text is identical to the intended layout.
+          BODY=$(printf '**SWARM TERMINAL-এ কোনো heartbeat পাওয়া যায়নি (%s সেকেন্ড)** — ইঞ্জিন সম্ভবত বন্ধ বা সাসপেন্ডেড।\n\n**কী করবেন:** ড্যাশবোর্ড (preview) খুলুন — boot auto-heal ইঞ্জিন ও keep-alive নিজে থেকেই আবার চালু করে দেবে, সব trading state (bankroll, positions, learnings) ঠিক থাকবে।\n\n*(এটি যদি simulate=down টেস্ট হিসেবে খোলা হয় — কিছু করার নেই, heartbeat ফিরলে নিজেই বন্ধ হয়ে যাবে)*\n\n---\nAutomated alert · SWARM TERMINAL external watch · auto-closes on recovery' "$AGE_H")
+          jq -n --arg t "$TITLE" --arg b "$BODY" '{title: $t, body: $b}' > /tmp/issue.json
+          curl -s -X POST -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            https://api.github.com/repos/emonhmamun/keep-alive-pinger/issues \
+            -d @/tmp/issue.json > /dev/null
+          echo "ALERT: issue opened — GitHub emailed the repo owner"
+
+      # ── C2. auto-close the alert when the heartbeat recovers ────────────
+      - name: Recovered — close alert issue
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$HEARTBEAT" != "FRESH" ]; then
+            echo "no fresh-heartbeat verdict — not touching alerts"
+            exit 0
+          fi
+          NUMS=$(curl -s -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/emonhmamun/keep-alive-pinger/issues?state=open&per_page=100" \
+            | jq -r '.[] | select(.title | contains("SWARM TERMINAL DOWN")) | .number')
+          if [ -z "$NUMS" ]; then
+            echo "no open alert — nothing to do"
+            exit 0
+          fi
+          for N in $NUMS; do
+            curl -s -X PATCH -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/emonhmamun/keep-alive-pinger/issues/$N" \
+              -d '{"state":"closed"}' > /dev/null
+            echo "RECOVERED: alert issue #$N closed (heartbeat fresh again)"
+          done
