@@ -1,43 +1,84 @@
 # ============================================================
-# SWARM TERMINAL Keep-Alive — External Pinger (DIAGNOSTIC RUN)
-# Temporary diagnostic build — measures where external pings stall.
+# SWARM TERMINAL Keep-Alive — External Pinger
+# ============================================================
+# Runs every 5 minutes from GitHub's servers (worldwide, 24/7).
+# Pings the SWARM TERMINAL sandbox public URL to generate inbound traffic,
+# which prevents the cloud container from being suspended.
+#
+# This is Layer 2 of the 24/7 keep-alive architecture:
+#   - Layer 1 (internal): /home/sync/keep-alive/keepalive.js
+#   - Layer 2 (external): THIS workflow
+#
+# PRIVACY: No URL is hardcoded here. The URL is read from the
+# encrypted GitHub secret SWARM_TERMINAL_URL. No project source code,
+# no sensitive data is exposed in this file.
+#
+# NOTE (2026-11-09): the current sandbox URL resolves to an
+# internal-only address (AliCloud FC internal endpoint / CGNAT), so
+# pings from the internet cannot reach it yet — the workflow reports
+# this honestly as UNREACHABLE. Layer 1 (internal watchdog) provides
+# the active keep-alive. If the sandbox later gets an internet-routable
+# URL, update the SWARM_TERMINAL_URL secret and this layer goes live
+# with zero other changes.
+#
+# Public repo = unlimited GitHub Actions minutes (free).
 # ============================================================
 name: SWARM TERMINAL Keep-Alive
 
 on:
   schedule:
+    # Every 5 minutes (the minimum cron granularity for GitHub Actions)
     - cron: '*/5 * * * *'
+  # Allow manual triggering from the Actions tab
   workflow_dispatch:
 
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 2
     steps:
       - name: Ping SWARM TERMINAL sandbox
         env:
+          # URL comes from encrypted repository secret — never logged
           PING_URL: ${{ secrets.SWARM_TERMINAL_URL }}
         run: |
+          # If the secret is not set, exit cleanly (don't fail the workflow)
           if [ -z "$PING_URL" ]; then
-            echo "Secret not set"
+            echo "⚠️ SWARM_TERMINAL_URL secret is not configured."
+            echo "   Set it in: Settings → Secrets and variables → Actions → New repository secret"
+            echo "   Name: SWARM_TERMINAL_URL"
+            echo "   Value: https://your-sandbox-public-url"
             exit 0
           fi
+
+          echo "Pinging SWARM TERMINAL sandbox (URL hidden for privacy)..."
+
+          # session-affinity header required by the sandbox gateway;
+          # IPv4 forced; 20s budget per ping (cold gateway paths can
+          # take >10s before a warm response follows).
           SID="github-actions-pinger"
-          echo "runner egress IP: $(curl -s -m 8 ifconfig.me || echo unknown)"
-          echo "--- attempt 1: root + session id, 60s budget, full timing ---"
-          curl -4 -s -m 60 --connect-timeout 10 -o /dev/null \
-            -w "code=%{http_code} dns=%{time_namelookup}s conn=%{time_connect}s tls=%{time_appconnect}s ttfb=%{time_starttransfer}s total=%{time_total}s\n" \
-            -H "x-session-id: $SID" "$PING_URL" || echo "curl exit code: $?"
-          echo "--- attempt 2: keepalive-status + session id, 30s budget ---"
-          curl -4 -s -m 30 --connect-timeout 10 -o /dev/null \
-            -w "code=%{http_code} dns=%{time_namelookup}s conn=%{time_connect}s tls=%{time_appconnect}s ttfb=%{time_starttransfer}s total=%{time_total}s\n" \
-            -H "x-session-id: $SID" "$PING_URL/api/keepalive-status" || echo "curl exit code: $?"
-          echo "--- attempt 3: NO session header (gateway reachable at all?), verbose ---"
-          curl -4 -s -v -m 15 --connect-timeout 8 -o /dev/null \
-            -w "code=%{http_code} conn=%{time_connect}s tls=%{time_appconnect}s ttfb=%{time_starttransfer}s total=%{time_total}s\n" \
-            "$PING_URL" 2>&1 | grep -E "Trying|Connected|SSL|HTTP|code=|error|timed|refused|curl exit" | head -15
-          echo "--- attempt 4: root again (warm?), 30s budget ---"
-          curl -4 -s -m 30 --connect-timeout 10 -o /dev/null \
-            -w "code=%{http_code} dns=%{time_namelookup}s conn=%{time_connect}s tls=%{time_appconnect}s ttfb=%{time_starttransfer}s total=%{time_total}s\n" \
-            -H "x-session-id: $SID" "$PING_URL" || echo "curl exit code: $?"
+
+          # Layer A: root path first (lightest — warms the gateway route)
+          ROOT_RESPONSE=$(curl -4 -s -m 20 --connect-timeout 8 -o /dev/null -w "%{http_code}" -H "x-session-id: $SID" "$PING_URL" 2>/dev/null || true)
+          : "${ROOT_RESPONSE:=000}"
+
+          # Layer B: keepalive-status (auto-starts internal keep-alive if down)
+          KEEPALIVE_RESPONSE=$(curl -4 -s -m 20 --connect-timeout 8 -o /dev/null -w "%{http_code}" -H "x-session-id: $SID" "$PING_URL/api/keepalive-status" 2>/dev/null || true)
+          : "${KEEPALIVE_RESPONSE:=000}"
+
+          # Layer C: engine health through the app proxy (auto-heals the engine)
+          HEALTH_RESPONSE=$(curl -4 -s -m 20 --connect-timeout 8 -o /dev/null -w "%{http_code}" -H "x-session-id: $SID" "$PING_URL/api/health" 2>/dev/null || true)
+          : "${HEALTH_RESPONSE:=000}"
+
+          echo "  / (root)              → HTTP $ROOT_RESPONSE"
+          echo "  /api/keepalive-status → HTTP $KEEPALIVE_RESPONSE"
+          echo "  /api/health           → HTTP $HEALTH_RESPONSE"
+
+          # Any non-000 response means the server responded = alive
+          if [ "$ROOT_RESPONSE" != "000" ] || [ "$KEEPALIVE_RESPONSE" != "000" ] || [ "$HEALTH_RESPONSE" != "000" ]; then
+            echo "✅ ALIVE — server responded"
+          else
+            echo "⚠️ UNREACHABLE — ping was sent (may wake the container on next request)"
+          fi
+
           echo "Done."
